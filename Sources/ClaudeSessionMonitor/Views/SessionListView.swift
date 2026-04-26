@@ -314,7 +314,7 @@ struct SessionDetailView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 8) {
                             ForEach(messages) { msg in
-                                MessageBubble(message: msg)
+                                MessageBubble(message: msg, sessionTty: session.devTty)
                                     .id(msg.id)
                             }
                         }
@@ -431,35 +431,144 @@ struct SessionDetailView: View {
 
 struct MessageBubble: View {
     let message: SessionMessage
+    let sessionTty: String?
 
     var body: some View {
-        HStack {
-            if message.role == .user { Spacer(minLength: 40) }
+        switch message.role {
+        case .user:
+            userBubble
+        case .assistant:
+            assistantBubble
+        case .toolCall:
+            toolCallBubble
+        case .toolResult:
+            EmptyView()
+        }
+    }
 
-            VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 2) {
-                Text(message.role == .user ? "👤 You" : "🤖 Claude")
+    private var userBubble: some View {
+        HStack {
+            Spacer(minLength: 40)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("👤 You")
                     .font(.caption2)
                     .foregroundColor(.secondary)
-
-                Text(truncated)
+                Text(truncated(500))
                     .font(.system(.caption))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
                     .background(
                         RoundedRectangle(cornerRadius: 10)
-                            .fill(message.role == .user
-                                  ? Color.accentColor.opacity(0.15)
-                                  : Color.secondary.opacity(0.1))
+                            .fill(Color.accentColor.opacity(0.15))
                     )
                     .textSelection(.enabled)
             }
-
-            if message.role == .assistant { Spacer(minLength: 40) }
         }
     }
 
-    private var truncated: String {
-        let maxLen = 500
+    private var assistantBubble: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("🤖 Claude")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Text(truncated(500))
+                    .font(.system(.caption))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color.secondary.opacity(0.1))
+                    )
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 40)
+        }
+    }
+
+    private var toolCallBubble: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // Tool header
+            HStack(spacing: 4) {
+                Image(systemName: toolIcon)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                Text(message.toolCall?.name ?? "Tool")
+                    .font(.system(.caption, design: .monospaced, weight: .semibold))
+                    .foregroundColor(.orange)
+                if let desc = message.toolCall?.description {
+                    Text("— \(desc)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+            }
+
+            // Command/content
+            Text(truncated(400))
+                .font(.system(.caption, design: .monospaced))
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color(.textBackgroundColor).opacity(0.6))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+                )
+                .textSelection(.enabled)
+
+            // Confirm / Reject buttons (only for active sessions)
+            if sessionTty != nil, message.toolCall?.name == "Bash" ||
+               message.toolCall?.name == "Write" || message.toolCall?.name == "Edit" {
+                HStack(spacing: 12) {
+                    Button {
+                        if let tty = sessionTty {
+                            ITerm2Bridge.sendText(tty: tty, text: "y")
+                        }
+                    } label: {
+                        Label("允许", systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    }
+                    .buttonStyle(.borderless)
+
+                    Button {
+                        if let tty = sessionTty {
+                            ITerm2Bridge.sendText(tty: tty, text: "n")
+                        }
+                    } label: {
+                        Label("拒绝", systemImage: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    }
+                    .buttonStyle(.borderless)
+
+                    Spacer()
+                }
+                .padding(.leading, 4)
+            }
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 4)
+    }
+
+    private var toolIcon: String {
+        switch message.toolCall?.name {
+        case "Bash": return "terminal"
+        case "Write": return "doc.badge.plus"
+        case "Edit": return "pencil"
+        case "Read": return "doc.text"
+        case "Grep": return "magnifyingglass"
+        case "Glob": return "folder.badge.magnifyingglass"
+        case "Agent": return "person.2"
+        default: return "wrench"
+        }
+    }
+
+    private func truncated(_ maxLen: Int) -> String {
         if message.text.count > maxLen {
             return String(message.text.prefix(maxLen)) + "..."
         }

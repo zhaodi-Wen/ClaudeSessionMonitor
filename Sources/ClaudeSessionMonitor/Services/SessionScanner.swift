@@ -133,9 +133,8 @@ class SessionScanner: ObservableObject {
                     messages.append(SessionMessage(role: .user, text: content))
                 }
             } else if type == "assistant" {
-                if let content = extractAssistantContent(from: obj) {
-                    messages.append(SessionMessage(role: .assistant, text: content))
-                }
+                let extracted = extractAssistantMessages(from: obj)
+                messages.append(contentsOf: extracted)
             }
         }
 
@@ -179,23 +178,144 @@ class SessionScanner: ObservableObject {
         return raw.isEmpty ? nil : raw
     }
 
-    private func extractAssistantContent(from obj: [String: Any]) -> String? {
+    private func extractAssistantMessages(from obj: [String: Any]) -> [SessionMessage] {
         guard let message = obj["message"] as? [String: Any],
-              let contentArray = message["content"] as? [[String: Any]] else { return nil }
+              let contentArray = message["content"] as? [[String: Any]] else { return [] }
 
-        var parts: [String] = []
+        var results: [SessionMessage] = []
+        var textParts: [String] = []
+
         for block in contentArray {
-            if block["type"] as? String == "text",
-               let t = block["text"] as? String {
-                parts.append(t)
-            } else if block["type"] as? String == "tool_use",
-                      let name = block["name"] as? String {
-                parts.append("🔧 \(name)")
+            let blockType = block["type"] as? String ?? ""
+
+            if blockType == "text", let t = block["text"] as? String {
+                let cleaned = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleaned.isEmpty {
+                    textParts.append(cleaned)
+                }
+            } else if blockType == "tool_use", let name = block["name"] as? String {
+                // Flush any accumulated text first
+                if !textParts.isEmpty {
+                    results.append(SessionMessage(role: .assistant, text: textParts.joined(separator: "\n")))
+                    textParts.removeAll()
+                }
+
+                let input = block["input"] as? [String: Any] ?? [:]
+                let toolCall = parseToolCall(name: name, input: input)
+
+                let displayText = formatToolCall(name: name, toolCall: toolCall)
+                results.append(SessionMessage(role: .toolCall, text: displayText, toolCall: toolCall))
             }
         }
 
-        let text = parts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
+        // Flush remaining text
+        if !textParts.isEmpty {
+            results.append(SessionMessage(role: .assistant, text: textParts.joined(separator: "\n")))
+        }
+
+        return results
+    }
+
+    private func parseToolCall(name: String, input: [String: Any]) -> ToolCallInfo {
+        switch name {
+        case "Bash":
+            return ToolCallInfo(
+                name: name,
+                command: input["command"] as? String,
+                description: input["description"] as? String,
+                filePath: nil,
+                detail: nil
+            )
+        case "Write":
+            let content = input["content"] as? String
+            let preview = content.map { String($0.prefix(200)) }
+            return ToolCallInfo(
+                name: name,
+                command: nil,
+                description: nil,
+                filePath: input["file_path"] as? String,
+                detail: preview
+            )
+        case "Edit":
+            let oldStr = input["old_string"] as? String
+            let newStr = input["new_string"] as? String
+            var detail = ""
+            if let o = oldStr { detail += "- \(String(o.prefix(100)))\n" }
+            if let n = newStr { detail += "+ \(String(n.prefix(100)))" }
+            return ToolCallInfo(
+                name: name,
+                command: nil,
+                description: nil,
+                filePath: input["file_path"] as? String,
+                detail: detail.isEmpty ? nil : detail
+            )
+        case "Read":
+            return ToolCallInfo(
+                name: name,
+                command: nil,
+                description: nil,
+                filePath: input["file_path"] as? String,
+                detail: nil
+            )
+        case "Grep":
+            return ToolCallInfo(
+                name: name,
+                command: nil,
+                description: "pattern: \(input["pattern"] as? String ?? "")",
+                filePath: input["path"] as? String,
+                detail: nil
+            )
+        case "Glob":
+            return ToolCallInfo(
+                name: name,
+                command: nil,
+                description: "pattern: \(input["pattern"] as? String ?? "")",
+                filePath: input["path"] as? String,
+                detail: nil
+            )
+        default:
+            // Agent, AskUserQuestion, TaskCreate, etc.
+            let desc = input["description"] as? String ?? input["subject"] as? String
+            let prompt = input["prompt"] as? String
+            return ToolCallInfo(
+                name: name,
+                command: nil,
+                description: desc,
+                filePath: nil,
+                detail: prompt.map { String($0.prefix(150)) }
+            )
+        }
+    }
+
+    private func formatToolCall(name: String, toolCall: ToolCallInfo) -> String {
+        var parts: [String] = []
+
+        switch name {
+        case "Bash":
+            parts.append("$ \(toolCall.command ?? "(empty)")")
+            if let desc = toolCall.description {
+                parts.insert("// \(desc)", at: 0)
+            }
+        case "Write":
+            parts.append("Write → \(toolCall.filePath ?? "?")")
+            if let d = toolCall.detail { parts.append(d + "...") }
+        case "Edit":
+            parts.append("Edit → \(toolCall.filePath ?? "?")")
+            if let d = toolCall.detail { parts.append(d) }
+        case "Read":
+            parts.append("Read → \(toolCall.filePath ?? "?")")
+        case "Grep":
+            parts.append("Grep \(toolCall.description ?? "")")
+            if let p = toolCall.filePath { parts.append("in \(p)") }
+        case "Glob":
+            parts.append("Glob \(toolCall.description ?? "")")
+        default:
+            parts.append(name)
+            if let desc = toolCall.description { parts.append(desc) }
+            if let d = toolCall.detail { parts.append(d) }
+        }
+
+        return parts.joined(separator: "\n")
     }
 
     private func updateSessions(_ results: [SessionInfo]) {
@@ -376,9 +496,26 @@ struct SessionMessage: Identifiable {
     let id = UUID()
     let role: Role
     let text: String
+    let toolCall: ToolCallInfo?
+
+    init(role: Role, text: String, toolCall: ToolCallInfo? = nil) {
+        self.role = role
+        self.text = text
+        self.toolCall = toolCall
+    }
 
     enum Role {
         case user
         case assistant
+        case toolCall    // a tool invocation by assistant
+        case toolResult  // result returned to assistant
     }
+}
+
+struct ToolCallInfo {
+    let name: String        // e.g. "Bash", "Write", "Edit", "Read"
+    let command: String?    // for Bash: the command string
+    let description: String? // human-readable description
+    let filePath: String?   // for Write/Edit/Read: the file path
+    let detail: String?     // additional info (edit content, etc.)
 }
