@@ -2,10 +2,12 @@ import SwiftUI
 
 struct SessionListView: View {
     @ObservedObject var scanner: SessionScanner
+    var onTogglePin: ((Bool) -> Void)?
     @State private var searchText = ""
     @State private var showOnlyActive = false
     @State private var selectedSession: SessionInfo? = nil
     @State private var launchAtLoginEnabled = LaunchAtLogin.isEnabled
+    @State private var isPinned = false
 
     private var filteredSessions: [SessionInfo] {
         var list = scanner.sessions
@@ -26,7 +28,7 @@ struct SessionListView: View {
         VStack(spacing: 0) {
             if let session = selectedSession {
                 // Detail view
-                SessionDetailView(session: session, scanner: scanner) {
+                SessionDetailView(session: session, scanner: scanner, isPinned: $isPinned, onTogglePin: onTogglePin) {
                     selectedSession = nil
                 }
             } else {
@@ -51,6 +53,18 @@ struct SessionListView: View {
                 Text("\(active) 活跃 / \(total) 总计")
                     .font(.caption)
                     .foregroundColor(.secondary)
+
+                // Pin button
+                Button {
+                    isPinned.toggle()
+                    onTogglePin?(isPinned)
+                } label: {
+                    Image(systemName: isPinned ? "pin.fill" : "pin")
+                        .font(.caption)
+                        .foregroundColor(isPinned ? .accentColor : .secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(isPinned ? "取消固定" : "固定浮窗")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -216,6 +230,8 @@ struct SessionRow: View {
 struct SessionDetailView: View {
     let session: SessionInfo
     let scanner: SessionScanner
+    @Binding var isPinned: Bool
+    var onTogglePin: ((Bool) -> Void)?
     let onBack: () -> Void
 
     @State private var messages: [SessionMessage] = []
@@ -224,6 +240,7 @@ struct SessionDetailView: View {
     @State private var refreshTimer: Timer? = nil
     @State private var inputText = ""
     @State private var isSending = false
+    @State private var readOffset: UInt64 = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -264,6 +281,18 @@ struct SessionDetailView: View {
                             refreshTimer?.invalidate()
                         }
                     }
+
+                // Pin button
+                Button {
+                    isPinned.toggle()
+                    onTogglePin?(isPinned)
+                } label: {
+                    Image(systemName: isPinned ? "pin.fill" : "pin")
+                        .font(.caption)
+                        .foregroundColor(isPinned ? .accentColor : .secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(isPinned ? "取消固定" : "固定浮窗")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -386,9 +415,10 @@ struct SessionDetailView: View {
 
     private func loadMessages() {
         DispatchQueue.global(qos: .userInitiated).async {
-            let msgs = scanner.readSessionContent(session: session, maxMessages: 50)
+            let result = scanner.readSessionContent(session: session, lastOffset: 0)
             DispatchQueue.main.async {
-                messages = msgs
+                messages = result.messages
+                readOffset = result.newOffset
                 isLoading = false
             }
         }
@@ -398,9 +428,12 @@ struct SessionDetailView: View {
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
             DispatchQueue.global(qos: .utility).async {
-                let msgs = scanner.readSessionContent(session: session, maxMessages: 50)
-                DispatchQueue.main.async {
-                    messages = msgs
+                let result = scanner.readSessionContent(session: session, lastOffset: readOffset)
+                if !result.messages.isEmpty {
+                    DispatchQueue.main.async {
+                        messages.append(contentsOf: result.messages)
+                        readOffset = result.newOffset
+                    }
                 }
             }
         }

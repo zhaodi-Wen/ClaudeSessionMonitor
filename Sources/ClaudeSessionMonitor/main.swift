@@ -4,7 +4,9 @@ import SwiftUI
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
+    var pinnedWindow: NSWindow?
     let scanner = SessionScanner()
+    var isPinned = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Status bar
@@ -15,12 +17,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
         }
 
-        // Popover
+        // Popover (used when not pinned)
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 400, height: 520)
+        popover.contentSize = NSSize(width: 420, height: 560)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(
-            rootView: SessionListView(scanner: scanner)
+            rootView: SessionListView(scanner: scanner, onTogglePin: { [weak self] pinned in
+                self?.setPinned(pinned)
+            })
         )
 
         // New session notification
@@ -31,7 +35,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
-        // Scan on background thread to avoid blocking run loop
+        // Scan on background thread
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.scanner.scan()
             DispatchQueue.main.async {
@@ -50,12 +54,61 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func setPinned(_ pinned: Bool) {
+        isPinned = pinned
+
+        if pinned {
+            // Detach from popover → create a standalone floating window
+            popover.performClose(nil)
+
+            let contentView = SessionListView(scanner: scanner, onTogglePin: { [weak self] p in
+                self?.setPinned(p)
+            })
+
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 420, height: 560),
+                styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            window.contentViewController = NSHostingController(rootView: contentView)
+            window.title = "Claude Session Monitor"
+            window.titlebarAppearsTransparent = true
+            window.isMovableByWindowBackground = true
+            window.level = .floating  // Always on top
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+            // Position near the menu bar icon
+            if let buttonFrame = statusItem.button?.window?.frame {
+                let x = buttonFrame.origin.x
+                let y = buttonFrame.origin.y - 560
+                window.setFrameOrigin(NSPoint(x: x, y: y))
+            } else {
+                window.center()
+            }
+
+            window.makeKeyAndOrderFront(nil)
+            window.delegate = self
+            pinnedWindow = window
+        } else {
+            // Close floating window, go back to popover mode
+            pinnedWindow?.close()
+            pinnedWindow = nil
+        }
+    }
+
     func updateBadge() {
         let active = scanner.sessions.filter(\.isActive).count
         statusItem?.button?.title = active > 0 ? "⌘ \(active)" : "⌘"
     }
 
     @objc func togglePopover() {
+        // If pinned window is open, bring it to front
+        if isPinned, let window = pinnedWindow {
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+
         guard let button = statusItem?.button else { return }
         if popover.isShown {
             popover.performClose(nil)
@@ -67,6 +120,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+}
+
+extension AppDelegate: NSWindowDelegate {
+    func windowWillClose(_ notification: Notification) {
+        // If user closes the pinned window via red button, unpin
+        isPinned = false
+        pinnedWindow = nil
     }
 }
 

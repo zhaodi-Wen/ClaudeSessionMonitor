@@ -106,18 +106,24 @@ class SessionScanner: ObservableObject {
         updateSessions(results)
     }
 
-    /// Read the latest conversation content from a session JSONL
-    func readSessionContent(session: SessionInfo, maxMessages: Int = 30) -> [SessionMessage] {
-        guard let fh = FileHandle(forReadingAtPath: session.filePath) else { return [] }
+    /// Read the full conversation content from a session JSONL
+    /// Uses incremental reading: pass lastOffset to only read new data
+    func readSessionContent(session: SessionInfo, lastOffset: UInt64 = 0) -> (messages: [SessionMessage], newOffset: UInt64) {
+        guard let fh = FileHandle(forReadingAtPath: session.filePath) else { return ([], 0) }
         defer { fh.closeFile() }
 
-        // Read the whole file (or last portion for large files)
         let fileSize = fh.seekToEndOfFile()
-        let readFrom: UInt64 = fileSize > 200_000 ? fileSize - 200_000 : 0
-        fh.seek(toFileOffset: readFrom)
+
+        // If no new data, return empty
+        if lastOffset >= fileSize {
+            return ([], lastOffset)
+        }
+
+        // Seek to where we left off
+        fh.seek(toFileOffset: lastOffset)
         let data = fh.readDataToEndOfFile()
 
-        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        guard let text = String(data: data, encoding: .utf8) else { return ([], lastOffset) }
 
         var messages: [SessionMessage] = []
 
@@ -138,11 +144,7 @@ class SessionScanner: ObservableObject {
             }
         }
 
-        // Return last N messages
-        if messages.count > maxMessages {
-            return Array(messages.suffix(maxMessages))
-        }
-        return messages
+        return (messages, fileSize)
     }
 
     private func extractContent(from obj: [String: Any]) -> String? {
