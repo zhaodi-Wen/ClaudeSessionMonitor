@@ -29,10 +29,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // New session notification
         scanner.onNewSession = { session in
-            NotificationManager.shared.send(
-                title: "新 Claude Session",
-                body: "\(session.projectShort): \(session.summary)"
-            )
+            NotificationManager.shared.notifyNewSession(session: session)
         }
 
         // Scan on background thread
@@ -43,13 +40,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Periodic refresh
+        // Periodic refresh (scan sessions every 10s)
         Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             DispatchQueue.global(qos: .utility).async {
                 self?.scanner.scan()
                 DispatchQueue.main.async {
                     self?.updateBadge()
                 }
+            }
+        }
+
+        // Event monitor (check for tool calls, completion, errors every 5s)
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            DispatchQueue.global(qos: .utility).async {
+                self?.scanner.monitorEvents()
             }
         }
     }

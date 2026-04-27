@@ -16,6 +16,11 @@ class SessionScanner: ObservableObject {
     private var knownSessionIds: Set<String> = []
     var onNewSession: ((SessionInfo) -> Void)?
 
+    // Background event monitoring
+    private var monitorOffsets: [String: UInt64] = [:]  // sessionId → file offset
+    private var lastAssistantTime: [String: Date] = [:]  // sessionId → last assistant message time
+    private var pendingToolCalls: Set<String> = []       // sessionId that has pending tool call
+
     init() {
         self.basePath = NSHomeDirectory() + "/.claude-internal/projects"
     }
@@ -104,6 +109,123 @@ class SessionScanner: ObservableObject {
         knownSessionIds = newIds
 
         updateSessions(results)
+    }
+
+    /// Monitor active sessions for events and send notifications
+    func monitorEvents() {
+        let activeSessions = sessions.filter { $0.isActive }
+
+        for session in activeSessions {
+            let offset = monitorOffsets[session.id] ?? {
+                // First time: start from current end of file to avoid old notifications
+                let fm = FileManager.default
+                if let attrs = try? fm.attributesOfItem(atPath: session.filePath),
+                   let size = attrs[.size] as? UInt64 {
+                    monitorOffsets[session.id] = size
+                    return size
+                }
+                return UInt64(0)
+            }()
+
+            guard let fh = FileHandle(forReadingAtPath: session.filePath) else { continue }
+            defer { fh.closeFile() }
+
+            let fileSize = fh.seekToEndOfFile()
+            if offset >= fileSize {
+                // No new data — check for task completion
+                // If we had a recent assistant message and no new activity for 15+ seconds
+                if let lastTime = lastAssistantTime[session.id],
+                   Date().timeIntervalSince(lastTime) > 15,
+                   !pendingToolCalls.contains(session.id) {
+                    NotificationManager.shared.notifyTaskComplete(
+                        session: session,
+                        summary: String(session.summary.prefix(60))
+                    )
+                    lastAssistantTime.removeValue(forKey: session.id)
+                }
+                continue
+            }
+
+            // Read new data
+            fh.seek(toFileOffset: offset)
+            let data = fh.readDataToEndOfFile()
+            monitorOffsets[session.id] = fileSize
+
+            guard let text = String(data: data, encoding: .utf8) else { continue }
+
+            for line in text.components(separatedBy: "\n") {
+                guard !line.isEmpty,
+                      let jsonData = line.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else { continue }
+
+                let type = obj["type"] as? String ?? ""
+
+                if type == "assistant" {
+                    lastAssistantTime[session.id] = Date()
+                    pendingToolCalls.remove(session.id)
+
+                    // Check for tool calls that need confirmation
+                    if let message = obj["message"] as? [String: Any],
+                       let content = message["content"] as? [[String: Any]] {
+                        for block in content {
+                            if block["type"] as? String == "tool_use",
+                               let name = block["name"] as? String,
+                               let input = block["input"] as? [String: Any] {
+
+                                if name == "Bash" || name == "Write" || name == "Edit" {
+                                    pendingToolCalls.insert(session.id)
+                                    let detail: String
+                                    if name == "Bash" {
+                                        let cmd = (input["command"] as? String) ?? ""
+                                        detail = "$ \(String(cmd.prefix(80)))"
+                                    } else {
+                                        let path = (input["file_path"] as? String) ?? ""
+                                        detail = "\(name) → \(path)"
+                                    }
+                                    NotificationManager.shared.notifyToolWaiting(
+                                        session: session,
+                                        toolName: name,
+                                        detail: detail
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Check for error keywords in assistant text
+                    if let message = obj["message"] as? [String: Any],
+                       let content = message["content"] as? [[String: Any]] {
+                        for block in content {
+                            if block["type"] as? String == "text",
+                               let text = block["text"] as? String {
+                                let lower = text.lowercased()
+                                if lower.contains("error:") || lower.contains("failed") ||
+                                   lower.contains("exception") || lower.contains("panic") ||
+                                   lower.contains("fatal") {
+                                    let snippet = String(text.prefix(100))
+                                    NotificationManager.shared.notifyError(
+                                        session: session,
+                                        error: snippet
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // User message means the tool call was answered
+                if type == "user" {
+                    pendingToolCalls.remove(session.id)
+                    lastAssistantTime.removeValue(forKey: session.id)
+                }
+            }
+        }
+
+        // Clean up stale entries for sessions no longer active
+        let activeIds = Set(activeSessions.map(\.id))
+        monitorOffsets = monitorOffsets.filter { activeIds.contains($0.key) }
+        lastAssistantTime = lastAssistantTime.filter { activeIds.contains($0.key) }
+        pendingToolCalls = pendingToolCalls.filter { activeIds.contains($0) }
     }
 
     /// Read the full conversation content from a session JSONL
