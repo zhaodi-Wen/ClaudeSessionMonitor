@@ -465,6 +465,7 @@ struct SessionDetailView: View {
 struct MessageBubble: View {
     let message: SessionMessage
     let sessionTty: String?
+    @State private var actionTaken: String? = nil  // "allowed" or "rejected"
 
     var body: some View {
         switch message.role {
@@ -556,32 +557,47 @@ struct MessageBubble: View {
             // Confirm / Reject buttons (only for active sessions)
             if sessionTty != nil, message.toolCall?.name == "Bash" ||
                message.toolCall?.name == "Write" || message.toolCall?.name == "Edit" {
-                HStack(spacing: 12) {
-                    Button {
-                        if let tty = sessionTty {
-                            ITerm2Bridge.sendText(tty: tty, text: "y")
-                        }
-                    } label: {
-                        Label("允许", systemImage: "checkmark.circle.fill")
+                if let action = actionTaken {
+                    // Already acted — show status
+                    HStack(spacing: 4) {
+                        Image(systemName: action == "allowed" ? "checkmark.circle.fill" : "xmark.circle.fill")
                             .font(.caption)
-                            .foregroundColor(.green)
-                    }
-                    .buttonStyle(.borderless)
-
-                    Button {
-                        if let tty = sessionTty {
-                            ITerm2Bridge.sendText(tty: tty, text: "n")
-                        }
-                    } label: {
-                        Label("拒绝", systemImage: "xmark.circle.fill")
+                        Text(action == "allowed" ? "已允许" : "已拒绝")
                             .font(.caption)
-                            .foregroundColor(.red)
                     }
-                    .buttonStyle(.borderless)
+                    .foregroundColor(.secondary)
+                    .padding(.leading, 4)
+                } else {
+                    // Awaiting action
+                    HStack(spacing: 12) {
+                        Button {
+                            if let tty = sessionTty {
+                                ITerm2Bridge.sendText(tty: tty, text: "y")
+                                actionTaken = "allowed"
+                            }
+                        } label: {
+                            Label("允许", systemImage: "checkmark.circle.fill")
+                                .font(.caption)
+                                .foregroundColor(.green)
+                        }
+                        .buttonStyle(.borderless)
 
-                    Spacer()
+                        Button {
+                            if let tty = sessionTty {
+                                ITerm2Bridge.sendText(tty: tty, text: "n")
+                                actionTaken = "rejected"
+                            }
+                        } label: {
+                            Label("拒绝", systemImage: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundColor(.red)
+                        }
+                        .buttonStyle(.borderless)
+
+                        Spacer()
+                    }
+                    .padding(.leading, 4)
                 }
-                .padding(.leading, 4)
             }
         }
         .padding(.horizontal, 4)
