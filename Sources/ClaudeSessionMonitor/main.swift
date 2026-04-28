@@ -4,9 +4,8 @@ import SwiftUI
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
-    var pinnedWindow: NSWindow?
+    var pinnedWindows: [String: NSWindow] = [:]  // sessionId → window
     let scanner = SessionScanner()
-    var isPinned = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Status bar
@@ -17,13 +16,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
         }
 
-        // Popover (used when not pinned)
+        // Popover
         popover = NSPopover()
         popover.contentSize = NSSize(width: 420, height: 560)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(
-            rootView: SessionListView(scanner: scanner, onTogglePin: { [weak self] pinned in
-                self?.setPinned(pinned)
+            rootView: SessionListView(scanner: scanner, onPinSession: { [weak self] session in
+                self?.pinSession(session)
             })
         )
 
@@ -58,47 +57,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func setPinned(_ pinned: Bool) {
-        isPinned = pinned
-
-        if pinned {
-            // Detach from popover → create a standalone floating window
-            popover.performClose(nil)
-
-            let contentView = SessionListView(scanner: scanner, onTogglePin: { [weak self] p in
-                self?.setPinned(p)
-            })
-
-            let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 420, height: 560),
-                styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
-                backing: .buffered,
-                defer: false
-            )
-            window.contentViewController = NSHostingController(rootView: contentView)
-            window.title = "Claude Session Monitor"
-            window.titlebarAppearsTransparent = true
-            window.isMovableByWindowBackground = true
-            window.level = .floating  // Always on top
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-
-            // Position near the menu bar icon
-            if let buttonFrame = statusItem.button?.window?.frame {
-                let x = buttonFrame.origin.x
-                let y = buttonFrame.origin.y - 560
-                window.setFrameOrigin(NSPoint(x: x, y: y))
-            } else {
-                window.center()
-            }
-
-            window.makeKeyAndOrderFront(nil)
-            window.delegate = self
-            pinnedWindow = window
-        } else {
-            // Close floating window, go back to popover mode
-            pinnedWindow?.close()
-            pinnedWindow = nil
+    func pinSession(_ session: SessionInfo) {
+        // If already pinned, bring to front
+        if let existing = pinnedWindows[session.id] {
+            existing.makeKeyAndOrderFront(nil)
+            return
         }
+
+        // Close popover
+        popover.performClose(nil)
+
+        // Create a floating window with just this session's detail
+        let detailView = PinnedSessionDetailView(
+            session: session,
+            scanner: scanner,
+            onClose: { [weak self] in
+                self?.unpinSession(session.id)
+            }
+        )
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 560),
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = NSHostingController(rootView: detailView)
+        window.title = "\(session.projectShort) — \(String(session.summary.prefix(30)))"
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        // Offset each window slightly so they don't stack exactly
+        let offset = CGFloat(pinnedWindows.count) * 30
+        if let buttonFrame = statusItem.button?.window?.frame {
+            let x = buttonFrame.origin.x + offset
+            let y = buttonFrame.origin.y - 560
+            window.setFrameOrigin(NSPoint(x: x, y: y))
+        } else {
+            window.center()
+        }
+
+        window.makeKeyAndOrderFront(nil)
+
+        // Use a custom delegate to handle window close
+        let closeDelegate = WindowCloseDelegate { [weak self] in
+            self?.unpinSession(session.id)
+        }
+        window.delegate = closeDelegate
+        // Keep delegate alive by associating with window
+        objc_setAssociatedObject(window, "closeDelegate", closeDelegate, .OBJC_ASSOCIATION_RETAIN)
+
+        pinnedWindows[session.id] = window
+    }
+
+    func unpinSession(_ sessionId: String) {
+        if let window = pinnedWindows[sessionId] {
+            window.delegate = nil
+            window.orderOut(nil)
+        }
+        pinnedWindows.removeValue(forKey: sessionId)
     }
 
     func updateBadge() {
@@ -107,12 +126,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func togglePopover() {
-        // If pinned window is open, bring it to front
-        if isPinned, let window = pinnedWindow {
-            window.makeKeyAndOrderFront(nil)
-            return
-        }
-
         guard let button = statusItem?.button else { return }
         if popover.isShown {
             popover.performClose(nil)
@@ -127,12 +140,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-extension AppDelegate: NSWindowDelegate {
-    func windowWillClose(_ notification: Notification) {
-        // If user closes the pinned window via red button, unpin
-        isPinned = false
-        pinnedWindow = nil
-    }
+/// Handles window close button (red X)
+class WindowCloseDelegate: NSObject, NSWindowDelegate {
+    let onClose: () -> Void
+    init(onClose: @escaping () -> Void) { self.onClose = onClose }
+    func windowWillClose(_ notification: Notification) { onClose() }
 }
 
 let app = NSApplication.shared

@@ -41,6 +41,10 @@ class SessionScanner: ObservableObject {
 
             // Find processes matching this project by CWD
             let matchingProcs = activeProcs.filter { $0.projectKey == proj }
+            var usedProcPids: Set<Int32> = []
+
+            // Collect all sessions for this project
+            var projSessionIndices: [(idx: Int, birthTime: TimeInterval, mtime: Date)] = []
 
             for file in files where file.hasSuffix(".jsonl") {
                 let filePath = projPath + "/" + file
@@ -52,7 +56,6 @@ class SessionScanner: ObservableObject {
 
                 if size < 500 { continue }
 
-                // Get file birth time for process matching
                 let birthTime: TimeInterval
                 if let creationDate = attrs[.creationDate] as? Date {
                     birthTime = creationDate.timeIntervalSince1970
@@ -62,7 +65,7 @@ class SessionScanner: ObservableObject {
 
                 let summary = extractFirstUserMessage(filePath: filePath)
 
-                var info = SessionInfo(
+                let info = SessionInfo(
                     id: sessionId,
                     project: proj,
                     summary: summary,
@@ -71,26 +74,49 @@ class SessionScanner: ObservableObject {
                     filePath: filePath
                 )
 
-                // Match this session to a process by birth time ≈ process start time
-                // (within 60 seconds means this process created this JSONL)
-                if birthTime > 0 {
-                    var bestProc: ClaudeProcess? = nil
-                    var bestDiff = Double.infinity
-                    for proc in matchingProcs {
-                        let diff = abs(birthTime - proc.startEpoch)
-                        if diff < bestDiff {
-                            bestDiff = diff
-                            bestProc = proc
-                        }
-                    }
-                    if bestDiff < 60, let proc = bestProc {
-                        info.isActive = true
-                        info.pid = proc.pid
-                        info.tty = proc.tty
+                let idx = results.count
+                results.append(info)
+                projSessionIndices.append((idx: idx, birthTime: birthTime, mtime: mtime))
+            }
+
+            // Pass 1: Match by birth time ≈ process start time (within 60s)
+            for s in projSessionIndices {
+                guard s.birthTime > 0 else { continue }
+                var bestProc: ClaudeProcess? = nil
+                var bestDiff = Double.infinity
+                for proc in matchingProcs where !usedProcPids.contains(proc.pid) {
+                    let diff = abs(s.birthTime - proc.startEpoch)
+                    if diff < bestDiff {
+                        bestDiff = diff
+                        bestProc = proc
                     }
                 }
+                if bestDiff < 60, let proc = bestProc {
+                    results[s.idx].isActive = true
+                    results[s.idx].pid = proc.pid
+                    results[s.idx].tty = proc.tty
+                    usedProcPids.insert(proc.pid)
+                }
+            }
 
-                results.append(info)
+            // Pass 2: Fallback — match unmatched sessions (recently modified) to unmatched processes
+            // Sort unmatched sessions by mtime desc, unmatched procs by start time desc
+            let unmatchedSessions = projSessionIndices
+                .filter { !results[$0.idx].isActive }
+                .sorted { $0.mtime > $1.mtime }
+
+            let unmatchedProcs = matchingProcs
+                .filter { !usedProcPids.contains($0.pid) }
+                .sorted { $0.startEpoch > $1.startEpoch }
+
+            for (i, s) in unmatchedSessions.enumerated() {
+                // Only match sessions modified in the last 5 minutes (likely active)
+                guard s.mtime.timeIntervalSinceNow > -300 else { continue }
+                if i < unmatchedProcs.count {
+                    results[s.idx].isActive = true
+                    results[s.idx].pid = unmatchedProcs[i].pid
+                    results[s.idx].tty = unmatchedProcs[i].tty
+                }
             }
         }
 

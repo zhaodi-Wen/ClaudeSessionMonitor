@@ -2,12 +2,11 @@ import SwiftUI
 
 struct SessionListView: View {
     @ObservedObject var scanner: SessionScanner
-    var onTogglePin: ((Bool) -> Void)?
+    var onPinSession: ((SessionInfo) -> Void)?
     @State private var searchText = ""
     @State private var showOnlyActive = false
     @State private var selectedSession: SessionInfo? = nil
     @State private var launchAtLoginEnabled = LaunchAtLogin.isEnabled
-    @State private var isPinned = false
 
     private var filteredSessions: [SessionInfo] {
         var list = scanner.sessions
@@ -27,12 +26,10 @@ struct SessionListView: View {
     var body: some View {
         VStack(spacing: 0) {
             if let session = selectedSession {
-                // Detail view
-                SessionDetailView(session: session, scanner: scanner, isPinned: $isPinned, onTogglePin: onTogglePin) {
+                SessionDetailView(session: session, scanner: scanner, onPinSession: onPinSession) {
                     selectedSession = nil
                 }
             } else {
-                // List view
                 sessionListContent
             }
         }
@@ -53,18 +50,6 @@ struct SessionListView: View {
                 Text("\(active) 活跃 / \(total) 总计")
                     .font(.caption)
                     .foregroundColor(.secondary)
-
-                // Pin button
-                Button {
-                    isPinned.toggle()
-                    onTogglePin?(isPinned)
-                } label: {
-                    Image(systemName: isPinned ? "pin.fill" : "pin")
-                        .font(.caption)
-                        .foregroundColor(isPinned ? .accentColor : .secondary)
-                }
-                .buttonStyle(.borderless)
-                .help(isPinned ? "取消固定" : "固定浮窗")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -172,7 +157,6 @@ struct SessionRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            // Status indicator
             Circle()
                 .fill(session.isActive ? Color.green : Color.gray.opacity(0.3))
                 .frame(width: 8, height: 8)
@@ -207,7 +191,6 @@ struct SessionRow: View {
                     .truncationMode(.tail)
             }
 
-            // Arrow indicator
             Image(systemName: "chevron.right")
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -225,13 +208,12 @@ struct SessionRow: View {
     }
 }
 
-// MARK: - Session Detail View
+// MARK: - Session Detail View (inside popover)
 
 struct SessionDetailView: View {
     let session: SessionInfo
     let scanner: SessionScanner
-    @Binding var isPinned: Bool
-    var onTogglePin: ((Bool) -> Void)?
+    var onPinSession: ((SessionInfo) -> Void)?
     let onBack: () -> Void
 
     @State private var messages: [SessionMessage] = []
@@ -264,57 +246,261 @@ struct SessionDetailView: View {
                             ITerm2Bridge.activateSession(tty: tty)
                         }
                     } label: {
-                        Label("跳转 iTerm2", systemImage: "rectangle.topthird.inset.filled")
+                        Label("跳转", systemImage: "rectangle.topthird.inset.filled")
                     }
                     .buttonStyle(.borderless)
                     .foregroundColor(.accentColor)
                 }
 
-                // Auto refresh toggle
                 Toggle("自动刷新", isOn: $autoRefresh)
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                     .onChange(of: autoRefresh) { _, newVal in
-                        if newVal {
-                            startRefreshTimer()
-                        } else {
-                            refreshTimer?.invalidate()
-                        }
+                        if newVal { startRefreshTimer() } else { refreshTimer?.invalidate() }
                     }
 
-                // Pin button
+                // Pin this session as floating window
                 Button {
-                    isPinned.toggle()
-                    onTogglePin?(isPinned)
+                    refreshTimer?.invalidate()
+                    onPinSession?(session)
                 } label: {
-                    Image(systemName: isPinned ? "pin.fill" : "pin")
+                    Image(systemName: "pin")
                         .font(.caption)
-                        .foregroundColor(isPinned ? .accentColor : .secondary)
                 }
                 .buttonStyle(.borderless)
-                .help(isPinned ? "取消固定" : "固定浮窗")
+                .help("固定为独立悬浮窗")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
 
             // Session info
-            HStack(spacing: 6) {
+            sessionInfoBar
+
+            Divider()
+
+            // Messages
+            messageContent
+
+            // Chat input
+            chatInputBar
+        }
+        .onAppear {
+            loadMessages()
+            if autoRefresh { startRefreshTimer() }
+        }
+        .onDisappear {
+            refreshTimer?.invalidate()
+        }
+    }
+
+    private var sessionInfoBar: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(session.isActive ? Color.green : Color.gray.opacity(0.3))
+                .frame(width: 8, height: 8)
+            Text(session.projectShort)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+            Spacer()
+            Text(formatSize(session.fileSize))
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Text(session.timeAgo)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
+    }
+
+    @ViewBuilder
+    private var messageContent: some View {
+        if isLoading {
+            VStack {
+                ProgressView()
+                Text("加载中...")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding()
+        } else if messages.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.title2)
+                    .foregroundColor(.secondary)
+                Text("没有对话内容")
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 40)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(messages) { msg in
+                            MessageBubble(message: msg, sessionTty: session.devTty)
+                                .id(msg.id)
+                        }
+                    }
+                    .padding(8)
+                }
+                .frame(maxHeight: 450)
+                .onChange(of: messages.count) { _, _ in
+                    if let last = messages.last {
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
+                }
+                .onAppear {
+                    if let last = messages.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var chatInputBar: some View {
+        if session.tty != nil {
+            Divider()
+            HStack(spacing: 8) {
+                TextField("发送消息到此 session...", text: $inputText)
+                    .textFieldStyle(.plain)
+                    .font(.system(.body))
+                    .onSubmit { sendMessage() }
+                    .disabled(isSending)
+
+                Button {
+                    sendMessage()
+                } label: {
+                    Image(systemName: isSending ? "hourglass" : "paperplane.fill")
+                        .foregroundColor(inputText.isEmpty ? .secondary : .accentColor)
+                }
+                .buttonStyle(.borderless)
+                .disabled(inputText.isEmpty || isSending)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        } else {
+            Divider()
+            HStack {
+                Image(systemName: "info.circle")
+                    .foregroundColor(.secondary)
+                Text("未找到对应的终端进程，无法发送消息")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+    }
+
+    private func loadMessages() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = scanner.readSessionContent(session: session, lastOffset: 0)
+            DispatchQueue.main.async {
+                messages = result.messages
+                readOffset = result.newOffset
+                isLoading = false
+            }
+        }
+    }
+
+    private func startRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+            DispatchQueue.global(qos: .utility).async {
+                let result = scanner.readSessionContent(session: session, lastOffset: readOffset)
+                if !result.messages.isEmpty {
+                    DispatchQueue.main.async {
+                        messages.append(contentsOf: result.messages)
+                        readOffset = result.newOffset
+                    }
+                }
+            }
+        }
+    }
+
+    private func sendMessage() {
+        guard !inputText.isEmpty, let tty = session.devTty else { return }
+        let text = inputText
+        inputText = ""
+        isSending = true
+        ITerm2Bridge.sendText(tty: tty, text: text)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            isSending = false
+        }
+    }
+
+    private func formatSize(_ bytes: Int64) -> String {
+        if bytes < 1024 { return "\(bytes) B" }
+        if bytes < 1024 * 1024 { return "\(bytes / 1024) KB" }
+        return String(format: "%.1f MB", Double(bytes) / 1048576.0)
+    }
+}
+
+// MARK: - Pinned Session Detail View (standalone floating window)
+
+struct PinnedSessionDetailView: View {
+    let session: SessionInfo
+    let scanner: SessionScanner
+    let onClose: () -> Void
+
+    @State private var messages: [SessionMessage] = []
+    @State private var isLoading = true
+    @State private var autoRefresh = true
+    @State private var refreshTimer: Timer? = nil
+    @State private var inputText = ""
+    @State private var isSending = false
+    @State private var readOffset: UInt64 = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack(spacing: 8) {
                 Circle()
                     .fill(session.isActive ? Color.green : Color.gray.opacity(0.3))
                     .frame(width: 8, height: 8)
                 Text(session.projectShort)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
+
                 Spacer()
-                Text(formatSize(session.fileSize))
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                Text(session.timeAgo)
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+
+                if session.isActive, session.tty != nil {
+                    Button {
+                        if let tty = session.devTty {
+                            ITerm2Bridge.activateSession(tty: tty)
+                        }
+                    } label: {
+                        Label("跳转", systemImage: "rectangle.topthird.inset.filled")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundColor(.accentColor)
+                }
+
+                Toggle("自动刷新", isOn: $autoRefresh)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .onChange(of: autoRefresh) { _, newVal in
+                        if newVal { startRefreshTimer() } else { refreshTimer?.invalidate() }
+                    }
+
+                // Unpin (close this window)
+                Button {
+                    refreshTimer?.invalidate()
+                    onClose()
+                } label: {
+                    Image(systemName: "pin.slash")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("取消固定")
             }
             .padding(.horizontal, 12)
-            .padding(.bottom, 4)
+            .padding(.vertical, 8)
 
             Divider()
 
@@ -349,12 +535,9 @@ struct SessionDetailView: View {
                         }
                         .padding(8)
                     }
-                    .frame(maxHeight: 450)
                     .onChange(of: messages.count) { _, _ in
                         if let last = messages.last {
-                            withAnimation {
-                                proxy.scrollTo(last.id, anchor: .bottom)
-                            }
+                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                         }
                     }
                     .onAppear {
@@ -365,16 +548,14 @@ struct SessionDetailView: View {
                 }
             }
 
-            // Chat input bar
+            // Chat input
             if session.tty != nil {
                 Divider()
                 HStack(spacing: 8) {
                     TextField("发送消息到此 session...", text: $inputText)
                         .textFieldStyle(.plain)
                         .font(.system(.body))
-                        .onSubmit {
-                            sendMessage()
-                        }
+                        .onSubmit { sendMessage() }
                         .disabled(isSending)
 
                     Button {
@@ -388,25 +569,11 @@ struct SessionDetailView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
-            } else {
-                // No TTY - no running process found for this session
-                Divider()
-                HStack {
-                    Image(systemName: "info.circle")
-                        .foregroundColor(.secondary)
-                    Text("未找到对应的终端进程，无法发送消息")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
             }
         }
         .onAppear {
             loadMessages()
-            if autoRefresh {
-                startRefreshTimer()
-            }
+            if autoRefresh { startRefreshTimer() }
         }
         .onDisappear {
             refreshTimer?.invalidate()
@@ -444,19 +611,10 @@ struct SessionDetailView: View {
         let text = inputText
         inputText = ""
         isSending = true
-
         ITerm2Bridge.sendText(tty: tty, text: text)
-
-        // Brief delay then refresh to see the response coming in
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             isSending = false
         }
-    }
-
-    private func formatSize(_ bytes: Int64) -> String {
-        if bytes < 1024 { return "\(bytes) B" }
-        if bytes < 1024 * 1024 { return "\(bytes / 1024) KB" }
-        return String(format: "%.1f MB", Double(bytes) / 1048576.0)
     }
 }
 
@@ -465,7 +623,7 @@ struct SessionDetailView: View {
 struct MessageBubble: View {
     let message: SessionMessage
     let sessionTty: String?
-    @State private var actionTaken: String? = nil  // "allowed" or "rejected"
+    @State private var actionTaken: String? = nil
 
     var body: some View {
         switch message.role {
@@ -522,7 +680,6 @@ struct MessageBubble: View {
 
     private var toolCallBubble: some View {
         VStack(alignment: .leading, spacing: 4) {
-            // Tool header
             HStack(spacing: 4) {
                 Image(systemName: toolIcon)
                     .font(.caption2)
@@ -539,7 +696,6 @@ struct MessageBubble: View {
                 Spacer()
             }
 
-            // Command/content
             Text(truncated(400))
                 .font(.system(.caption, design: .monospaced))
                 .padding(8)
@@ -554,11 +710,9 @@ struct MessageBubble: View {
                 )
                 .textSelection(.enabled)
 
-            // Confirm / Reject buttons (only for active sessions)
             if sessionTty != nil, message.toolCall?.name == "Bash" ||
                message.toolCall?.name == "Write" || message.toolCall?.name == "Edit" {
                 if let action = actionTaken {
-                    // Already acted — show status
                     HStack(spacing: 4) {
                         Image(systemName: action == "allowed" ? "checkmark.circle.fill" : "xmark.circle.fill")
                             .font(.caption)
@@ -568,7 +722,6 @@ struct MessageBubble: View {
                     .foregroundColor(.secondary)
                     .padding(.leading, 4)
                 } else {
-                    // Awaiting action
                     HStack(spacing: 12) {
                         Button {
                             if let tty = sessionTty {
