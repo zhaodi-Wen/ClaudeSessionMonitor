@@ -6,7 +6,7 @@ set -e
 
 APP_NAME="Claude Session Monitor"
 BUNDLE_ID="com.claude.session-monitor"
-VERSION="1.9.0"
+VERSION="2.0.0"
 
 echo "🔨 Building ClaudeSessionMonitor v${VERSION}..."
 
