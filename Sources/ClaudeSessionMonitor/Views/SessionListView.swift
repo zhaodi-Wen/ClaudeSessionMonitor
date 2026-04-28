@@ -364,24 +364,9 @@ struct SessionDetailView: View {
     private var chatInputBar: some View {
         if session.tty != nil {
             Divider()
-            HStack(spacing: 8) {
-                TextField("发送消息到此 session...", text: $inputText)
-                    .textFieldStyle(.plain)
-                    .font(.system(.body))
-                    .onSubmit { sendMessage() }
-                    .disabled(isSending)
-
-                Button {
-                    sendMessage()
-                } label: {
-                    Image(systemName: isSending ? "hourglass" : "paperplane.fill")
-                        .foregroundColor(inputText.isEmpty ? .secondary : .accentColor)
-                }
-                .buttonStyle(.borderless)
-                .disabled(inputText.isEmpty || isSending)
+            ChatInputView(sessionTty: session.devTty!, isSending: $isSending, inputText: $inputText) {
+                sendMessage()
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
         } else {
             Divider()
             HStack {
@@ -551,24 +536,9 @@ struct PinnedSessionDetailView: View {
             // Chat input
             if session.tty != nil {
                 Divider()
-                HStack(spacing: 8) {
-                    TextField("发送消息到此 session...", text: $inputText)
-                        .textFieldStyle(.plain)
-                        .font(.system(.body))
-                        .onSubmit { sendMessage() }
-                        .disabled(isSending)
-
-                    Button {
-                        sendMessage()
-                    } label: {
-                        Image(systemName: isSending ? "hourglass" : "paperplane.fill")
-                            .foregroundColor(inputText.isEmpty ? .secondary : .accentColor)
-                    }
-                    .buttonStyle(.borderless)
-                    .disabled(inputText.isEmpty || isSending)
+                ChatInputView(sessionTty: session.devTty!, isSending: $isSending, inputText: $inputText) {
+                    sendMessage()
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
             }
         }
         .onAppear {
@@ -775,5 +745,211 @@ struct MessageBubble: View {
             return String(message.text.prefix(maxLen)) + "..."
         }
         return message.text
+    }
+}
+
+// MARK: - Chat Input with Image Support
+
+struct ChatInputView: View {
+    let sessionTty: String
+    @Binding var isSending: Bool
+    @Binding var inputText: String
+    let onSend: () -> Void
+
+    @State private var attachedImages: [URL] = []
+    @State private var isDragOver = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            // Attached images preview
+            if !attachedImages.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(attachedImages, id: \.self) { url in
+                            ZStack(alignment: .topTrailing) {
+                                if let nsImage = NSImage(contentsOf: url) {
+                                    Image(nsImage: nsImage)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fill)
+                                        .frame(width: 50, height: 50)
+                                        .clipped()
+                                        .cornerRadius(6)
+                                } else {
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .fill(Color.secondary.opacity(0.2))
+                                        .frame(width: 50, height: 50)
+                                        .overlay(
+                                            Image(systemName: "photo")
+                                                .foregroundColor(.secondary)
+                                        )
+                                }
+                                // Remove button
+                                Button {
+                                    attachedImages.removeAll { $0 == url }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.caption2)
+                                        .foregroundColor(.white)
+                                        .background(Circle().fill(Color.black.opacity(0.6)))
+                                }
+                                .buttonStyle(.borderless)
+                                .offset(x: 4, y: -4)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                }
+                .frame(height: 56)
+            }
+
+            // Input row
+            HStack(spacing: 8) {
+                // Attach image button
+                Button {
+                    pickImage()
+                } label: {
+                    Image(systemName: "photo.badge.plus")
+                        .font(.body)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("添加图片 (也可拖拽或粘贴)")
+
+                TextField("发送消息...", text: $inputText)
+                    .textFieldStyle(.plain)
+                    .font(.system(.body))
+                    .onSubmit { sendAll() }
+                    .disabled(isSending)
+
+                Button {
+                    sendAll()
+                } label: {
+                    Image(systemName: isSending ? "hourglass" : "paperplane.fill")
+                        .foregroundColor(canSend ? .accentColor : .secondary)
+                }
+                .buttonStyle(.borderless)
+                .disabled(!canSend || isSending)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .background(isDragOver ? Color.accentColor.opacity(0.05) : Color.clear)
+        .onDrop(of: [.fileURL, .image], isTargeted: $isDragOver) { providers in
+            handleDrop(providers)
+            return true
+        }
+        .onPasteCommand(of: [.image, .fileURL]) { providers in
+            handlePaste(providers)
+        }
+    }
+
+    private var canSend: Bool {
+        !inputText.isEmpty || !attachedImages.isEmpty
+    }
+
+    private func sendAll() {
+        guard canSend else { return }
+        isSending = true
+
+        // Build the message: image paths first, then text
+        var parts: [String] = []
+
+        for url in attachedImages {
+            parts.append(url.path)
+        }
+
+        if !inputText.isEmpty {
+            parts.append(inputText)
+        }
+
+        let fullMessage = parts.joined(separator: " ")
+        ITerm2Bridge.sendText(tty: sessionTty, text: fullMessage)
+
+        inputText = ""
+        attachedImages.removeAll()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            isSending = false
+        }
+    }
+
+    private func pickImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image, .png, .jpeg]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.title = "选择图片"
+
+        if panel.runModal() == .OK {
+            attachedImages.append(contentsOf: panel.urls)
+        }
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) {
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier("public.file-url") {
+                provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                    guard let data = data as? Data,
+                          let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                    let ext = url.pathExtension.lowercased()
+                    if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff"].contains(ext) {
+                        DispatchQueue.main.async {
+                            if !attachedImages.contains(url) {
+                                attachedImages.append(url)
+                            }
+                        }
+                    }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier("public.image") {
+                provider.loadItem(forTypeIdentifier: "public.image", options: nil) { data, _ in
+                    if let url = self.saveImageToTemp(data: data) {
+                        DispatchQueue.main.async {
+                            attachedImages.append(url)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func handlePaste(_ providers: [NSItemProvider]) {
+        // Check pasteboard for images
+        let pb = NSPasteboard.general
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [
+            .urlReadingContentsConformToTypes: ["public.image"]
+        ]) as? [URL], !urls.isEmpty {
+            attachedImages.append(contentsOf: urls)
+            return
+        }
+
+        // Check for image data in pasteboard
+        if let imgData = pb.data(forType: .png) ?? pb.data(forType: .tiff) {
+            if let url = saveDataToTemp(data: imgData, ext: "png") {
+                attachedImages.append(url)
+            }
+        }
+    }
+
+    private func saveImageToTemp(data: Any?) -> URL? {
+        if let url = data as? URL { return url }
+        if let data = data as? Data {
+            return saveDataToTemp(data: data, ext: "png")
+        }
+        return nil
+    }
+
+    private func saveDataToTemp(data: Data, ext: String) -> URL? {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-session-monitor", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+
+        let filename = "paste-\(UUID().uuidString.prefix(8)).\(ext)"
+        let url = tmpDir.appendingPathComponent(filename)
+        do {
+            try data.write(to: url)
+            return url
+        } catch {
+            return nil
+        }
     }
 }
