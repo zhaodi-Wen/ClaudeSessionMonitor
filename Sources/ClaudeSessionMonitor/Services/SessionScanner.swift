@@ -7,6 +7,7 @@ struct ClaudeProcess {
     let cwd: String
     let projectKey: String
     let startEpoch: TimeInterval  // process start time
+    let sessionId: String?        // Parsed from `--session-id <uuid>` in the CLI args, if present.
 }
 
 class SessionScanner: ObservableObject {
@@ -25,22 +26,58 @@ class SessionScanner: ObservableObject {
         self.basePath = NSHomeDirectory() + "/.claude-internal/projects"
     }
 
+    /// Append a debug line to ~/Library/Logs/ClaudeSessionMonitor.log.
+    /// Enabled by default so users can easily inspect matching behavior when
+    /// reporting "can't find session" issues.
+    private func debugLog(_ message: String) {
+        let logPath = NSHomeDirectory() + "/Library/Logs/ClaudeSessionMonitor.log"
+        let formatter = ISO8601DateFormatter()
+        let line = "[\(formatter.string(from: Date()))] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let fh = FileHandle(forWritingAtPath: logPath) {
+            fh.seekToEndOfFile()
+            fh.write(data)
+            fh.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: logPath, contents: data, attributes: nil)
+        }
+    }
+
     func scan() {
         let fm = FileManager.default
         var results: [SessionInfo] = []
         let activeProcs = getActiveClaudeProcesses()
+        debugLog("scan(): activeProcs=\(activeProcs.count)")
+        for p in activeProcs {
+            debugLog("  pid=\(p.pid) tty=\(p.tty) sid=\(p.sessionId ?? "nil") cwd=\(p.cwd)")
+        }
+
+        // Global sessionId → process map (session ids are globally unique UUIDs,
+        // so we don't even need to know the project for this lookup).
+        var procBySessionId: [String: ClaudeProcess] = [:]
+        for p in activeProcs {
+            if let sid = p.sessionId { procBySessionId[sid] = p }
+        }
 
         guard let projectDirs = try? fm.contentsOfDirectory(atPath: basePath) else {
             updateSessions(results)
             return
         }
 
+        // Track which pids have already been consumed across the whole scan so
+        // two sessions never claim the same process.
+        var usedProcPidsGlobal: Set<Int32> = []
+
         for proj in projectDirs {
             let projPath = basePath + "/" + proj
             guard let files = try? fm.contentsOfDirectory(atPath: projPath) else { continue }
 
-            // Find processes matching this project by CWD
-            let matchingProcs = activeProcs.filter { $0.projectKey == proj }
+            // Find processes matching this project by CWD.
+            // Use lossy-tolerant matching because Claude CLI collapses "/", " "
+            // and "." all to "-" in its project dir names.
+            let matchingProcs = activeProcs.filter {
+                $0.projectKey == proj || cwdMatchesProject(cwd: $0.cwd, projectKey: proj)
+            }
             var usedProcPids: Set<Int32> = []
 
             // Collect all sessions for this project
@@ -65,7 +102,7 @@ class SessionScanner: ObservableObject {
 
                 let summary = extractFirstUserMessage(filePath: filePath)
 
-                let info = SessionInfo(
+                var info = SessionInfo(
                     id: sessionId,
                     project: proj,
                     summary: summary,
@@ -74,17 +111,31 @@ class SessionScanner: ObservableObject {
                     filePath: filePath
                 )
 
+                // Pass 0: exact sessionId match from `claude --session-id <uuid>`.
+                // This is by far the most reliable signal — skip all fuzzy matching
+                // when available.
+                if let proc = procBySessionId[sessionId],
+                   !usedProcPidsGlobal.contains(proc.pid) {
+                    info.isActive = true
+                    info.pid = proc.pid
+                    info.tty = proc.tty
+                    usedProcPidsGlobal.insert(proc.pid)
+                    usedProcPids.insert(proc.pid)
+                    debugLog("Pass0 match: session=\(sessionId) -> pid=\(proc.pid) tty=\(proc.tty)")
+                }
+
                 let idx = results.count
                 results.append(info)
                 projSessionIndices.append((idx: idx, birthTime: birthTime, mtime: mtime))
             }
 
             // Pass 1: Match by birth time ≈ process start time (within 60s)
-            for s in projSessionIndices {
+            for s in projSessionIndices where !results[s.idx].isActive {
                 guard s.birthTime > 0 else { continue }
                 var bestProc: ClaudeProcess? = nil
                 var bestDiff = Double.infinity
-                for proc in matchingProcs where !usedProcPids.contains(proc.pid) {
+                for proc in matchingProcs
+                where !usedProcPids.contains(proc.pid) && !usedProcPidsGlobal.contains(proc.pid) {
                     let diff = abs(s.birthTime - proc.startEpoch)
                     if diff < bestDiff {
                         bestDiff = diff
@@ -96,6 +147,7 @@ class SessionScanner: ObservableObject {
                     results[s.idx].pid = proc.pid
                     results[s.idx].tty = proc.tty
                     usedProcPids.insert(proc.pid)
+                    usedProcPidsGlobal.insert(proc.pid)
                 }
             }
 
@@ -106,16 +158,22 @@ class SessionScanner: ObservableObject {
                 .sorted { $0.mtime > $1.mtime }
 
             let unmatchedProcs = matchingProcs
-                .filter { !usedProcPids.contains($0.pid) }
+                .filter { !usedProcPids.contains($0.pid) && !usedProcPidsGlobal.contains($0.pid) }
                 .sorted { $0.startEpoch > $1.startEpoch }
 
             for (i, s) in unmatchedSessions.enumerated() {
-                // Only match sessions modified in the last 5 minutes (likely active)
-                guard s.mtime.timeIntervalSinceNow > -300 else { continue }
+                // Only match sessions modified in the last 24 hours (likely still the one
+                // currently attached to a running claude process). The old 5-minute
+                // window was too strict: when the monitor started while a claude
+                // process was idle (e.g. waiting for user input for >5 min), the
+                // session failed to get a tty and the UI showed "未找到对应的终端进程".
+                guard s.mtime.timeIntervalSinceNow > -86400 else { continue }
                 if i < unmatchedProcs.count {
+                    let proc = unmatchedProcs[i]
                     results[s.idx].isActive = true
-                    results[s.idx].pid = unmatchedProcs[i].pid
-                    results[s.idx].tty = unmatchedProcs[i].tty
+                    results[s.idx].pid = proc.pid
+                    results[s.idx].tty = proc.tty
+                    usedProcPidsGlobal.insert(proc.pid)
                 }
             }
         }
@@ -531,8 +589,12 @@ class SessionScanner: ObservableObject {
         let psTask = Process()
         let psPipe = Pipe()
         psTask.executableURL = URL(fileURLWithPath: "/bin/ps")
-        // Use etime (elapsed time) for start time calculation
-        psTask.arguments = ["-eo", "pid,tty,%cpu,etime,command"]
+        // -ww → do NOT truncate the command column. Without this, macOS `ps`
+        // falls back to an ~80-column default when stdout is a pipe (which is
+        // our case — we're capturing output). That truncation drops the
+        // trailing `--session-id <uuid>` argument and breaks sessionId
+        // matching completely.
+        psTask.arguments = ["-eww", "-o", "pid,tty,%cpu,etime,command"]
         psTask.standardOutput = psPipe
         psTask.standardError = FileHandle.nullDevice
 
@@ -543,28 +605,46 @@ class SessionScanner: ObservableObject {
         guard let psOutput = String(data: psData, encoding: .utf8) else { return [] }
 
         let now = Date().timeIntervalSince1970
-        var candidates: [(pid: Int32, tty: String, cpu: Double, startEpoch: TimeInterval)] = []
+        var candidates: [(pid: Int32, tty: String, cpu: Double, startEpoch: TimeInterval, sessionId: String?)] = []
 
         for line in psOutput.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard (trimmed.hasSuffix("/claude") || trimmed.hasSuffix("claude") || trimmed.contains("claude "))
-                    && !trimmed.contains("grep")
-                    && !trimmed.contains("--output-format")
-                    && !trimmed.contains("ClaudeSessionMonitor")
-                    && !trimmed.contains("CSMonitor")
-                    && !trimmed.contains("claude-internal") else { continue }
-
+            // Split first so we can check the command column precisely (avoid
+            // false-positive excludes like a CWD path that contains "claude-internal").
             let parts = trimmed.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
             guard parts.count >= 5, let pid = Int32(parts[0]) else { continue }
 
             let tty = String(parts[1])
             let cpu = Double(parts[2]) ?? 0.0
             let elapsedStr = String(parts[3])
+            let command = String(parts[4])
+
+            // Match a running Claude CLI. Modern installs ship as a node-wrapped
+            // binary ("claude.exe", "claude-internal", "claude-code"), while old
+            // installs still use a plain "claude" binary. Accept all of them.
+            let isClaude = command.contains("claude.exe")
+                || command.contains("claude-internal")
+                || command.contains("claude-code")
+                || command.hasSuffix("/claude")
+                || command == "claude"
+                || command.hasPrefix("claude ")
+                || command.contains("/claude ")
+            guard isClaude else { continue }
+
+            // Exclude our own monitor process.
+            if command.contains("ClaudeSessionMonitor")
+                || command.contains("CSMonitor")
+                || command.contains("grep ") { continue }
+
             guard tty != "??" && tty != "-" else { continue }
+
+            // Try to parse "--session-id <uuid>" out of the command line so we
+            // can match the OS process to a .jsonl session file deterministically.
+            let sessionId = extractSessionId(from: command)
 
             let elapsedSecs = parseEtime(elapsedStr)
             let startEpoch = now - elapsedSecs
-            candidates.append((pid, tty, cpu, startEpoch))
+            candidates.append((pid, tty, cpu, startEpoch, sessionId))
         }
 
         // Step 2: get CWD for each candidate using lsof
@@ -598,11 +678,29 @@ class SessionScanner: ObservableObject {
                 cpuPercent: c.cpu,
                 cwd: cwd,
                 projectKey: projectKey,
-                startEpoch: c.startEpoch
+                startEpoch: c.startEpoch,
+                sessionId: c.sessionId
             ))
         }
 
         return procs
+    }
+
+    /// Extract the UUID following a `--session-id` / `--session_id` flag, if any.
+    private func extractSessionId(from command: String) -> String? {
+        let tokens = command.split(separator: " ").map(String.init)
+        for (i, tok) in tokens.enumerated() {
+            if tok == "--session-id" || tok == "--session_id" {
+                if i + 1 < tokens.count { return tokens[i + 1] }
+            }
+            if tok.hasPrefix("--session-id=") {
+                return String(tok.dropFirst("--session-id=".count))
+            }
+            if tok.hasPrefix("--session_id=") {
+                return String(tok.dropFirst("--session_id=".count))
+            }
+        }
+        return nil
     }
 
     /// Parse ps etime format: "DD-HH:MM:SS", "HH:MM:SS", or "MM:SS"
@@ -627,18 +725,46 @@ class SessionScanner: ObservableObject {
         return secs
     }
 
-    /// Convert a CWD like "/Users/diwen/foo/bar" to project key like "-Users-diwen-foo-bar"
+    /// Convert a CWD like "/Users/diwen/foo/bar" to project key like "-Users-diwen-foo-bar".
+    /// Claude CLI replaces "/", " " and "." with "-" in its project-dir names, so we do the same.
     private func cwdToProjectKey(_ cwd: String) -> String {
-        // Project dirs use format: "-" + path with "/" replaced by "-" and spaces by "-"
-        // e.g. /Users/diwen → -Users-diwen
-        //      /Users/diwen/Desktop/ai → -Users-diwen-Desktop-ai
-        var key = cwd.replacingOccurrences(of: "/", with: "-")
+        // Resolve symlinks / normalize to match what Claude CLI recorded.
+        let normalized = URL(fileURLWithPath: cwd).standardizedFileURL.path
+        var key = normalized
+            .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: " ", with: "-")
-        // Ensure leading hyphen (the dirs all start with -)
-        if !key.hasPrefix("-") {
-            key = "-" + key
-        }
+            .replacingOccurrences(of: ".", with: "-")
+        if !key.hasPrefix("-") { key = "-" + key }
         return key
+    }
+
+    /// Check if a process CWD matches the given project dir name.
+    /// Tries several normalizations because Claude CLI's naming is lossy
+    /// (both "." and "/" collapse to "-"), so one cwd can match multiple names
+    /// and one name can match multiple cwds. We prefer exact match, then a
+    /// "dash-insensitive" compare as a fallback.
+    private func cwdMatchesProject(cwd: String, projectKey projKey: String) -> Bool {
+        guard !cwd.isEmpty else { return false }
+        let candidate = cwdToProjectKey(cwd)
+        if candidate == projKey { return true }
+
+        // Fallback: compare after collapsing runs of '-' (handles edge cases
+        // where the project dir was created from a slightly different path).
+        func collapse(_ s: String) -> String {
+            var out = ""
+            var prevDash = false
+            for ch in s {
+                if ch == "-" {
+                    if !prevDash { out.append(ch) }
+                    prevDash = true
+                } else {
+                    out.append(ch)
+                    prevDash = false
+                }
+            }
+            return out
+        }
+        return collapse(candidate) == collapse(projKey)
     }
 }
 
